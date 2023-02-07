@@ -1,0 +1,471 @@
+---
+title: "COVID-19 Analysis"
+author: "Binh Minh An Nguyen"
+date: "April 18, 2022"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+    number_sections: yes
+    theme: cerulean
+  pdf_document:
+    toc: yes
+    number_sections: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align  = "center",
+                      fig.height = 5,
+                      fig.width  = 6)
+```
+ 
+
+- **Context** 
+  + This COVID-19 dataset contains live data as up to the most recent date
+  + The analysis in this document was made as up to April 18th, 2022
+
+
+# Work with nested data frame
+1. Download COVID data files at the John's Hopkins site
+
+```{r}
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+```
+
+2. Create a tibble named `df` with a variable called `file_names`
+    + time_series_covid19_confirmed_global.csv
+    + time_series_covid19_deaths_global.csv
+
+```{r packages, echo=FALSE}
+library(tidyverse)
+
+df <- tibble(file_names = c("time_series_covid19_confirmed_global.csv",
+                            "time_series_covid19_deaths_global.csv"))
+```
+
+
+3. Create a variable in the data frame called `url` that puts `url_in` on the front of each file_name to create a complete URL.
+
+```{r}
+df <- df %>% 
+  mutate(url = str_c(url_in, file_names, sep = ""))
+```
+
+4. Create a list column called `data` with each row holding the downloaded data frame for each file
+
+```{r}
+df <- df %>% 
+  mutate(data = map(url, ~read_csv(., na = "NA")))
+```
+
+5. Extract the **unique part** in each file name to use those as table name, then keep the key values only
+
+```{r}
+df <- df %>% 
+  mutate(case_type = as.factor(
+    str_sub(file_names, 21, -12)
+  )) %>%
+  select(case_type, data)
+```
+
+
+
+# Clean Data  
+1. Compare the column name of each tibble
+ 
+```{r}
+# Add names of 15 columns each
+df <- df %>% 
+  mutate(vars = map(data, function(data) names(flatten(df$data)[1:15])))
+
+# Check names for each tibble
+df$vars[[1]]
+df$vars[[2]]
+```
+
+
+2. 
+  ### Create a customized function to fix the name pattern
+
+```{r}
+fix_names <- function(df, p, repp) {
+  stopifnot("Input must be a data frame!" = str_detect(class(df), "tbl|data.frame|tbl_df|spec_tbl_df") == TRUE)
+  stopifnot("Pattern must be a string value!" = is.character(p) & is.character(repp))
+  names(df) <- str_replace_all(names(df), p, repp)
+  return(df)
+}
+```
+
+```{r}
+df <- df %>% 
+  mutate(
+    data = map(data, ~fix_names(.,"([ey])/", "\\1_")),
+    data = map(data, ~unite(., "Country_State",
+                            c("Country_Region", "Province_State"),
+                            remove = FALSE,
+                            na.rm = TRUE,
+                            sep = " ")),
+    data = map(data, ~select(., -c(Lat, Long))),
+    data = map(
+      data, 
+      ~select(., Country_Region, Country_State, Province_State, everything()))
+  )
+
+### Synchronize vars variable
+df <- df %>% 
+  mutate(vars = map(data, function(data) names(flatten(df$data)[1:15])))
+
+df$vars[[1]]
+df$vars[[2]]
+
+### Count number of rows in each data frame
+df %>% 
+  summarize(n = map(data, ~nrow(.))) %>% 
+  mutate(n = as.integer(n))
+```
+
+
+# Clean up each dataframe 
+1. Create a pivot table to see the total data by day
+
+```{r}
+df %>% 
+  mutate(
+    data = map(data, 
+               ~pivot_longer(data = .,
+                             cols = contains("/"),
+                             names_to = "Date",
+                             values_to = "Daily_Total",
+                             names_transform = list(Date = lubridate::mdy))
+  )) -> df_long
+```
+
+2. Check the total number of records
+
+```{r}
+df_long %>% 
+  summarize(n = map(data, ~nrow(.))) %>% 
+  mutate(n = as.integer(n))
+```
+
+3. Briefly describe the record at each row
+
+Each row in the first tibble describes the daily number of confirmed Covid-19 cases in a specific region/country from January 22nd, 2020 to `r Sys.Date()-1`, while each row in the second tibble describe the daily number of deaths due to Covid-19 given locations and dates.
+
+
+# Add Continents 
+1.  Extract a list of continent name using package {countrycode}
+
+```{r}
+library(countrycode)
+df_long %>% 
+  mutate(
+    data = map(data, 
+               ~mutate(., Continent = countrycode(Country_Region,
+                                                  origin = "country.name",
+                                                  destination = "continent")))
+  ) -> df_long
+```
+
+
+2. Correct the continent name
+
+```{r}
+df_long %>% 
+  mutate(
+    data = map(data,
+               ~mutate(., Continent = case_when(Country_Region == "Antarctica" ~ "Europe",
+                                                Country_Region == "Diamond Princess" ~ "Asia",
+                                                Country_Region == "Kosovo" ~ "Europe",
+                                                Country_Region == "Micronesia" ~ "Americas",
+                                                Country_Region == "MS Zaandam" ~ "Europe",
+                                                Country_Region == "Summer Olympics 2020" ~ "Asia",
+                                                Country_Region == "Winter Olympics 2022" ~ "Asia",
+                                                TRUE ~ Continent))
+            )
+  ) -> df_long
+
+# Check the continents
+map(df_long$data, ~unique(.$Continent))
+
+
+# Unnest the dataframe
+df_long %>% 
+  unnest(cols = data) %>% 
+  ungroup() -> df_all
+```
+
+3. Remove unwanted elements from the environment.
+
+```{r}
+remove(df, df_long)
+
+df_all <- df_all %>% 
+  select(-vars)
+```
+
+
+# Get World Population Data
+1.a.  The data is from the [UN](https://population.un.org/wpp/Download/Standard/CSV/) which uses different country names in many cases from the COVID data. It also uses a different structure for separating countries and territories.
+  - Filter countries and territories that have different names used by JHU and UN
+
+```{r}
+df_pop <- read_csv("./data/WPP2019_TotalPopulation.csv")
+
+# B - countries not in df_pop
+df_all %>% 
+  anti_join(df_pop, by = c("Country_Region" = "Location")) %>% 
+  distinct(Country_Region)
+
+# C - countries not in df_all
+pop_not_cv <- df_pop %>% 
+  anti_join(df_all, by = c("Location" = "Country_Region"))
+
+pop_not_cv %>% 
+  distinct(Location)
+count(pop_not_cv)
+
+# D - % world population not in covid data
+sum(pop_not_cv$PopTotal)*100/sum(df_pop$PopTotal) # % unit
+```
+
+
+2. Rank the countries by population and density 
+
+```{r}
+df_pop %>% 
+  semi_join(df_all, by = c("Location" = "Country_Region")) %>% 
+  mutate(
+    rank_d = dplyr::min_rank(desc(PopDensity)),
+    rank_p = dplyr::min_rank(desc(PopTotal))
+  ) -> df_pop
+```
+
+3. Display Top 10 countries by each type of rank
+
+```{r}
+# Top 10 countries ranked by Population
+df_pop %>% 
+  arrange(rank_p) %>% 
+  select(Location) %>% 
+  head(10)
+
+# Top 10 countries ranked by Density
+df_pop %>% 
+  arrange(rank_d) %>% 
+  select(Location) %>% 
+  head(10)
+```
+
+
+# Add Population Data to `df_all`
+
+```{r}
+df_allp <- df_all %>% 
+  inner_join(df_pop, by = c("Country_Region" = "Location"))
+```
+
+
+# Explore geographic data - Country/State
+
+- Calculate the number of `Country States` for each `Country Region` for distinct combinations of `Country States` and `Country Region` where the `Country_Region` does **not have matching entries in `Country_State`**.
+
+```{r}
+# 1. Country with multiple regions
+df_allp %>% 
+  group_by(Country_Region) %>% 
+  distinct(Country_State) %>% 
+  count(Country_Region) %>% 
+  filter(n > 1) %>% 
+  arrange(desc(n))
+
+# 2. Country_State is different from Country_Region
+df_allp %>% 
+  mutate(
+    Country_Region = str_trim(Country_Region, side = "both"),
+    Country_State = str_trim(Country_State, side = "both")
+  ) %>% 
+  mutate(no_state = ifelse(Country_Region == Country_State, 1, 0)) %>% 
+  filter(no_state == 0) %>% 
+  group_by(Country_Region) %>% 
+  distinct(Country_State) %>% 
+  count(Country_Region)
+```
+
+- Explain what the difference between the two suggests for future analysis of totals for each country represented in `Country_Region`.
+
+In **Part 1**, we consider those with reported data at the country level as single combination of country-state each, and such single level combination is equivalent to the full level of country-state combination. Thus, all countries are qualified for the country-state combination calculations. From there, we only choose the countries with at least 2 states.
+
+In **Part 2**, we distinguish countries based on the reporting levels. In particular, countries that have reported data without the state level are not qualified for the country-state combination calculation. 
+
+# Analyze Data
+1. Create a data frame with data grouped by `Country_Region`, `Continent` `case_type`, `rank_p` and `rank_d` that summarizes the current totals and the totals as a percentage of total population.
+  - Create grand totals for each of the two global case types for both `df_all` and your new data frame and compare them.
+
+```{r}
+df_allp %>% 
+  group_by(Country_Region, Continent, case_type, rank_p, rank_d) %>% 
+  summarize(
+    current_total = max(Daily_Total),
+    percent_total = current_total/(PopTotal*1000)
+  ) %>% 
+  ungroup() %>% 
+  distinct() -> df_total
+
+df_total %>% 
+  group_by(case_type) %>% 
+  summarize(
+    grand_current = sum(current_total),
+    grand_percent = sum(percent_total))
+
+# df_all data frame - grand total by case_type
+df_all_tmp <- df_all %>% 
+  left_join(df_pop, by = c("Country_Region" = "Location")) %>% 
+  mutate(PopTotal = ifelse(is.na(PopTotal), 0, PopTotal)) %>% 
+  filter(Date == max(Date))
+  
+tmp_pop <- df_all_tmp %>% 
+  select(Country_Region, PopTotal) %>% 
+  distinct() %>% 
+  mutate(n = sum(PopTotal*1000)) %>% 
+  select(Country_Region, n)
+
+df_all_tmp %>% 
+  inner_join(tmp_pop, by = c("Country_Region" = "Country_Region")) %>% 
+  group_by(case_type) %>% 
+  summarize(
+    grand_current = sum(Daily_Total),
+    grand_percent = grand_current/n
+  ) %>% 
+  distinct()
+```
+
+**Analysis**
+
+On the one hand, at the first calculation, we only took data of the common countries from the `df_allp` data frame to generate the new data frame. After that, the percentage of confirmed Covid cases and death cases were computed at the row level, and the grand total of percentage is sum of the computed row-wised percentages.
+
+On the other hand, at the second calculation, we left join `df_all` data frame with the `df_pop` data frame. Since there are 6 locations that are included in the `df_all` data frame but not included in the `df_pop` data frame, the number of Covid cases are higher than those at the first calculation. In addition, the percentage is accumulated from all countries, leading to different results in the grand percentage calculation.
+
+Because of the computation differences, the first method is correct at country/regional level, while the second calculation is correct at the world wide level (excluding those region does not have any Covid case records).
+
+2. Top 20 Countries with the most confirmed cases and what is the percentage of their total population affected
+
+```{r}
+df_total %>% 
+  filter(case_type == "confirmed") %>% 
+  arrange(desc(current_total)) %>% 
+  select(Country_Region, current_total, percent_total, rank_p, rank_d) %>% 
+  head(20) -> confirmed
+confirmed
+```
+
+3. Top 20 Countries with the most deaths and what is the percentage of their total population affected
+
+```{r}
+df_total %>% 
+  filter(case_type == "deaths") %>% 
+  arrange(desc(current_total)) %>% 
+  select(Country_Region, current_total, percent_total, rank_p, rank_d) %>% 
+  head(20) -> deaths
+deaths
+```
+
+4. Describe the results based on the totals with the rankings for total population and population density.
+
+```{r, include=FALSE}
+confirmed %>% 
+  inner_join(deaths, by = c("Country_Region" = "Country_Region")) %>% 
+  select(Country_Region, rank_d.x, rank_p.x)
+
+confirmed %>% 
+  bind_rows(deaths) %>%
+  group_by(Country_Region) %>% 
+  mutate(obs = 1) %>% 
+  filter(sum(obs) == 1) %>% 
+  select(Country_Region, rank_d, rank_p)
+```
+
+16 countries are leading both number of confirmed Covid cases and number of deaths, including US, European countries, South Americas, India, Indonesia. These are either developed countries, countries with open opinions on Covid-19 risk mitigations, or countries with large population.
+
+Vietnam, Korea, and Japan are the top 3 Asia countries leading the number of confirmed Covid cases, but are not in the top 20 countries with the highest number of deaths. Meanwhile, Peru, Ukraine, South Africa, and Romania, despite the medium rank of population and density, are still in the top 20 of deaths but not in the top 20 of confirmed cases.
+
+# High percentage but low totals countries
+
+```{r}
+# Top 20 confirmed percentage but not in the top 20 confirmed cases
+df_total %>% 
+  filter(case_type == "confirmed") %>% 
+  arrange(desc(percent_total)) %>% 
+  head(20) %>% 
+  anti_join(confirmed, by = c("Country_Region" = "Country_Region"))
+
+# Top 20 death percentage but not in the top 20 deaths
+df_total %>% 
+  filter(case_type == "deaths") %>% 
+  arrange(desc(percent_total)) %>% 
+  head(20) %>% 
+  anti_join(deaths, by = c("Country_Region" = "Country_Region"))
+```
+
+**Analysis**
+
+18 out of 20 countries in the top 20 countries with high confirmed case percentage are not the top 20 for absolute cases, while it is 15 countries for the deaths ranks. 
+
+In general, these countries have medium to smaller size of population, leading to the high percentage of infected cases. Meanwhile, the density rank does not contribute much to explain the scenarios in these countries.
+
+
+# Plotting the data - Time Series
+- Create two plots, each for the number of cases and the number of deaths respectively
+- Limit to the top 20 `Country_Region`
+- Show each country and facet by continent with the same scale for the y axis. Use a log scale for the y axis.
+- Interpret each plot
+
+```{r}
+# Plot for the confirmed cases
+df_allp %>% 
+  inner_join(confirmed, by = c("Country_Region" = "Country_Region")) %>% 
+  filter(case_type == "confirmed") %>% 
+  group_by(Country_Region, Date) %>% 
+  mutate(confirmed_total = sum(Daily_Total)) %>% 
+  ggplot() +
+  geom_line(aes(x = Date, y = confirmed_total, color = Country_Region)) +
+  facet_wrap(~Continent) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(
+    title = "Top 20 Countries of confirmed Covid-19 cases overtime",
+    y = "accummulated cases"
+  )
+
+# Plot for the deaths
+df_allp %>% 
+  inner_join(deaths, by = c("Country_Region" = "Country_Region")) %>% 
+  filter(case_type == "deaths") %>% 
+  group_by(Country_Region, Date) %>% 
+  mutate(confirmed_total = sum(Daily_Total)) %>% 
+  ggplot() +
+  geom_line(aes(x = Date, y = confirmed_total, color = Country_Region)) +
+  facet_wrap(~Continent) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(
+    title = "Top 20 Countries of deaths due to Covid-19 overtime",
+    y = "accummulated deaths"
+  )
+```
+
+**Analysis**
+
+* The top 20 countries with the highest number of confirmed cases are allocated in 3 Continents - Americas, Asia, and Europe. And generally, the number of confirmed Covid cases increased exponentially worldwide during the early of 2020 to the second half of 2020. In particular to each continent:
+
+   - The first 30 confirmed cases (approximately) are recorded in the US by the early of 2021. Up to the present, US has always been leading the number of confirmed cases. Meanwhile the latest record shows that Mexico is having the lowest confirmed cases among Americas countries.
+   - In Asia, Covid confirmed cases were spread during the Summer 2020, with India having the highest cumulative number of cases. On the other hand, Vietnam noticeably from a Covid-safety country turns into one of the Top 20 countries for Covid cases.
+   - The trend of Covid cases are pretty similar among these Europe countries. The number of Covid cases still increases but tends to slow down by the beginning of 2021.
+
+* The top 20 countries with the highest number of deaths contain 4 Continents: Europe, Americas, Asia, and Africa. Overall, the number of deaths due to Covid-19 increased exponentially when the virus was just confirmed in the earlier of 2020 until the Summer 2020. Among all, we observe that:
+
+  - South Africa is the only country in Africa continent that falls into this Top 20.
+  - In Asia, India continues to lead with the highest cumulative number of deaths overtime, when Turkey holds the lowest number of deaths, as up to the latest records.
+  - In Americas, US continues to lead the top countries that have the highest number of deaths due to Covid-19, while the trends seems to slow down in Argentina and Colombia.
+  - The trends of deaths due to Covid-19 are similar among Europe countries.
